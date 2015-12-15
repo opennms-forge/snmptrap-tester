@@ -1,115 +1,98 @@
-#!/bin/bash
-# ----------------------------------------------------------------------------------------
-# This is a quick and dirty solution to allow sending snmp
-# version 2 traps pretending that the trap comes from the equipment supposed
-# to send it (The receiver MUST beleive that it comes from the real equipment).
+#!/bin/bash -e
+# This script allows to send SNMP v2 traps by spoofing the source address and pretends the trap
+# come from another device, so the receiver MUST believe it comes from a real equipment.
+# To spoof the source IP address of the the trap iptables is used.
+# For this reason it is required to run this script as 'root'.
 #
-# The only solution that was proposed (and possible) was source IP spoofing.
-# As suggested by other contributors, the solution would be in using iptables
-# (Mangle tables were proposed but this would not work) on the linux box
-# where we originate the trap.
-#
-# The solution was to write a little front-end script that would take the required snmptrap
-# parameters (the default values needed by Zeljko being hard coded in the script) + the
-# required source IP address for the trap (the IP address that we will do spoofing with).
-#
-# The script must be run by 'root' user because it must manipulate the iptables.
-# The snmptrap command path must be in the calling user $PATH variable.
-#
-# The script is overly simple and is certainly lacking other 'features'. It should, however,
-# give you the idea ...
-# ----------------------------------------------------------------------------------------
+# This script is originated from:
+# http://www.net-snmp.org/wiki/index.php/TUT:source_spoofing
 
-TRAP_RECEIVER="127.0.0.1"
-TRAP_FIXED_PARAMS="-v 2c -c public"
+# Default build identifier set to snapshot
 
-# For some coloured outputs ....
-ESC=`echo -e "\e"`
-red="${ESC}[31m"
-green="${ESC}[32m"
-norm="${ESC}[0m"
+REQUIRED_USER="root"
+USER=$(whoami)
 
-# Must be run as root because it must modify ip tables
-if [ `whoami` != "root" ]
-then
-  cat <<EOF
-$red
-Error:
-You must be root to use this command !
-Please execute 'sudo bash' first...
-$norm
-EOF
-  exit 1
+# Error codes
+E_ILLEGAL_ARGS=126
+E_BASH=127
+E_UNSUPPORTED=128
+
+
+DST="127.0.0.1"
+COMMUNITY="public"
+VERSION="2c"
+SNMP_TRAP_BIN=$(which snmptrap)
+
+# Test if snmptrap binary is available
+if [ ! -f "${SNMP_TRAP_BIN}" ]; then
+  echo "SNMP trap tool is not available."
+  echo "Please install Net-SNMP utilities."
+  exit ${E_UNSUPPORTED}
 fi
 
-
-if [ $# -lt 2 ]
-then
-  cat <<EOF
-$red
-Error:
-This command requires arguments !
-Arg 1: should be the trap source address (equipment address)
-Arg 2 to Arg n: should be arguments valid for the 'snmptrap -v 2c' command
-$norm
-EOF
-  exit 1
+# Setting Postgres User and changing configuration files require
+# root permissions.
+if [ "${USER}" != "${REQUIRED_USER}" ]; then
+  echo ""
+  echo "This script requires root permissions to be executed."
+  echo ""
+  exit ${E_BASH}
 fi
 
+####
+# Help function used in error messages and -h option
+usage() {
+  echo ""
+  echo "Send SNMP trap from source."
+  echo ""
+  echo "    Example with trap with spoofed source 10.23.42.1:"
+  echo "    ./snmptrap-from.sh 10.23.42.1 .1.3.6.1.4.1.2636.4.5.0.1 .1.3.6.1.4.1.2636.1.2.3.4 s 'just now!'"
+  echo ""
+  exit
+}
 
-# Simple, no checks on the parameter ! If it is not a proper IP, the iptables command will choke
-# and give an error description.
+if [ "$#" -lt 2 ]; then
+  # No enough args given show usage
+  usage
+fi
 
-SRC=$1
-shift   # get rid of the first parameter (Source IP)
-        # and let the snmptrap check the rest
-
+SRC="${1}"
+shift  # get rid of the first parameter (Source IP)
+       # and let the snmptrap check the rest
 
 # Rule insertion
-iptables -t nat -A POSTROUTING -d $TRAP_RECEIVER -p udp --dport 162 -j SNAT --to $SRC
-rc=$?
+iptables -t nat -A POSTROUTING -d "${DST}" -p udp --dport 162 -j SNAT --to "${SRC}"
+if [ "$?" -ne 0 ]; then
+  echo "iptables rules installation failed."
+  echo "You probably did not supply a proper source IP address."
+  echo "Please refer to the error messages from the iptables command above ..."
 
-if [ $rc -ne 0 ]
-then
-  cat <<EOF
-$red
-Error:
-iptables rules installation failed.
-You probably did not supply a proper source IP address.
-Please refer to the error messages from the iptables command above ...
-$norm
-EOF
   # for extra safety !
-  iptables -t nat -A POSTROUTING -d $TRAP_RECEIVER -p udp --dport 162 -j SNAT --to $SRC &>/dev/null
-  exit 1
+  iptables -t nat -A POSTROUTING -d "${DST}" -p udp --dport 162 -j SNAT --to "${SRC}" &>/dev/null
+  exit ${E_ILLEGAL_ARGS}
 fi
 
-snmptrap $TRAP_FIXED_PARAMS $TRAP_RECEIVER '' "$@"
-rc=$?
+# Send trap to destination
+snmptrap -v "${VERSION}" -c "${COMMUNITY}" "${DST}" '' "$@"
 
-if [ $rc -ne 0 ]
-then
-  cat <<EOF
-$red
-Error:
-snmptrap command failed !!! Trap was not sent.
-Please refer to the error messages from the snmptrap command above ...
-$norm
-EOF
+RESULT=$? # need for sleep later
+if [ ${RESULT} -ne 0 ]; then
+  echo "snmptrap command failed !!! Trap was not sent."
+  echo "Please refer to the error messages from the snmptrap command above ..."
+  exit ${E_ILLEGAL_ARGS}
 else
-  cat <<EOF
-$green
-Command OK. It was sent as:
-
-  snmptrap $TRAP_FIXED_PARAMS $TRAP_RECEIVER '' "$@"
-$norm
-EOF
+  echo "Command OK. It was sent as:"
+  echo "snmptrap $TRAP_FIXED_PARAMS $TRAP_RECEIVER '' \"$@\""
 fi
 
 # Leave some time to be sure snmptrap went thru iptables filters
-[ $rc -eq 0 ] && sleep 2
+[ ${RESULT} -eq 0 ] && sleep 2
 
 # Remove the current rules
-iptables -t nat -D POSTROUTING -d ${TRAP_RECEIVER} -p udp --dport 162 -j SNAT --to $SRC
+iptables -t nat -D POSTROUTING -d "${DST}" -p udp --dport 162 -j SNAT --to "${SRC}"
+if [ $? -ne 0 ]; then
+  echo "Error during removing the iptables rules"
+  exit ${E_ILLEGAL_ARGS}
+fi
 
-exit $rc
+exit 0
