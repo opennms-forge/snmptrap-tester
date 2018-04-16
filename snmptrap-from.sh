@@ -30,7 +30,6 @@ if [ ! -f "${SNMP_TRAP_BIN}" ]; then
   exit ${E_UNSUPPORTED}
 fi
 
-# Setting Postgres User and changing configuration files require
 # root permissions.
 if [ "${USER}" != "${REQUIRED_USER}" ]; then
   echo ""
